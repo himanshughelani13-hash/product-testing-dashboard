@@ -1971,7 +1971,7 @@
     }
 
     function makeAttachmentUrl(fileName) {
-      return apiBlob(`/api/uploads/${encodeURIComponent(fileName)}`).then((blob) => {
+      return apiBlob(`/api/files/${encodeURIComponent(fileName)}`).then((blob) => {
         const url = URL.createObjectURL(blob);
         attachmentObjectUrls.push(url);
         return url;
@@ -2078,7 +2078,7 @@
       if (previewObjectUrl) URL.revokeObjectURL(previewObjectUrl);
       previewObjectUrl = null;
       try {
-        const blob = await apiBlob(`/api/uploads/${encodeURIComponent(fileName)}`);
+        const blob = await apiBlob(`/api/files/${encodeURIComponent(fileName)}`);
         previewObjectUrl = URL.createObjectURL(blob);
         document.getElementById('preview-name').textContent = name || 'Evidence preview';
         document.getElementById('preview-image').src = previewObjectUrl;

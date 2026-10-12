@@ -34,11 +34,12 @@ const SUPPORTED_PRODUCTS = [
 const PASSWORD_HASH_BYTES = 64;
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 const MAX_FILES_PER_NOTE = 8;
+const MAX_TOTAL_ATTACHMENT_SIZE = 12 * 1024 * 1024;
 const MAX_BACKUP_SIZE = 250 * 1024 * 1024;
 const MAX_BACKUP_CONTENT_SIZE = 500 * 1024 * 1024;
 const MAX_BACKUP_ENTRIES = 5000;
 
-for (const directory of [DATA_DIR, PUBLIC_UPLOAD_DIR, PUBLIC_IMAGE_DIR, STORAGE_DIR, UPLOAD_DIR]) {
+for (const directory of [DATA_DIR, PUBLIC_IMAGE_DIR, STORAGE_DIR]) {
   fs.mkdirSync(directory, { recursive: true });
 }
 
@@ -64,6 +65,13 @@ const MIME_EXTENSIONS = new Map([
 ]);
 const EXTENSION_MIMES = new Map([...MIME_EXTENSIONS].map(([mime, extension]) => [extension, mime]));
 
+const ticketAttachmentSchema = new mongoose.Schema({
+  fileName: { type: String, required: true },
+  name: { type: String, required: true },
+  contentType: { type: String, required: true },
+  data: { type: Buffer, required: true },
+  size: { type: Number, required: true },
+}, { _id: false });
 const activityLogSchema = new mongoose.Schema({
   action: { type: String, required: true },
   statusFrom: String,
@@ -79,6 +87,7 @@ const ticketCommentSchema = new mongoose.Schema({
   author: { type: String, required: true },
   role: { type: String, enum: ['Developer', 'SiyanoAV Team', 'Auditor'], required: true },
   text: { type: String, required: true },
+  attachments: { type: [ticketAttachmentSchema], default: [] },
   createdAt: { type: Date, default: Date.now },
 });
 const ticketSchema = new mongoose.Schema({
@@ -91,6 +100,7 @@ const ticketSchema = new mongoose.Schema({
   product: String,
   activityLog: { type: [activityLogSchema], default: [] },
   comments: { type: [ticketCommentSchema], default: [] },
+  attachments: { type: [ticketAttachmentSchema], default: [] },
 }, {
   strict: false,
   versionKey: false,
@@ -333,6 +343,8 @@ function toMongoTicket(ticket) {
 function toApiTicket(document) {
   const ticket = document.toObject ? document.toObject() : document;
   const { _id, __v, ...fields } = ticket;
+  delete fields.attachments;
+  if (Array.isArray(fields.comments)) fields.comments = fields.comments.map(toApiComment);
   return {
     ...fields,
     id: String(_id),
@@ -371,13 +383,39 @@ async function initializeMongo() {
   }
 
   const migrationId = 'legacy-json-tickets-v1';
-  if (await Migration.exists({ _id: migrationId })) return;
-  if (!(await Ticket.exists({}))) {
-    if (initialTickets.length) {
+  if (!(await Migration.exists({ _id: migrationId }))) {
+    if (!(await Ticket.exists({})) && initialTickets.length) {
       await Ticket.insertMany(initialTickets.map(toMongoTicket));
     }
+    await Migration.create({ _id: migrationId, completedAt: new Date() });
   }
-  await Migration.create({ _id: migrationId, completedAt: new Date() });
+
+  const attachmentMigrationId = 'legacy-upload-files-to-mongodb-v1';
+  if (!(await Migration.exists({ _id: attachmentMigrationId }))) {
+    for (const note of getNotes()) {
+      const legacyAttachments = [];
+      for (const attachment of note.attachments || []) {
+        const fileName = attachment.fileName;
+        const filePath = typeof fileName === 'string' ? path.join(UPLOAD_DIR, path.basename(fileName)) : '';
+        if (!fileName || path.basename(fileName) !== fileName || !fs.existsSync(filePath)) continue;
+        const contentType = attachment.mimeType || EXTENSION_MIMES.get(path.extname(fileName).toLowerCase());
+        if (!contentType) continue;
+        legacyAttachments.push({
+          fileName,
+          name: attachment.name || fileName,
+          contentType,
+          data: fs.readFileSync(filePath),
+          size: fs.statSync(filePath).size,
+        });
+      }
+      if (legacyAttachments.length) {
+        await Ticket.updateOne({ _id: note.ticketId }, {
+          $push: { attachments: { $each: legacyAttachments } },
+        });
+      }
+    }
+    await Migration.create({ _id: attachmentMigrationId, completedAt: new Date() });
+  }
 }
 
 function normalizedTicketStatus(value) {
@@ -544,6 +582,7 @@ function parseBackupArchive(archivePath) {
   }
   let totalSize = 0;
   const uploadFiles = [];
+  const uploadSizes = new Map();
   const availableUploads = new Set();
   const normalizedUploadNames = new Set();
   const seenEntries = new Set();
@@ -620,6 +659,7 @@ function parseBackupArchive(archivePath) {
     availableUploads.add(fileName);
     try {
       uploadFiles.push({ fileName, data: entry.getData() });
+      uploadSizes.set(fileName, entrySize);
     } catch {
       const error = new Error('The backup contains an unreadable attachment.');
       error.status = 400;
@@ -646,6 +686,8 @@ function parseBackupArchive(archivePath) {
     ticketIds.add(ticket.id);
   }
   const noteIds = new Set();
+  const ticketUploadNames = new Map();
+  const ticketUploadSizes = new Map();
   for (const note of notes) {
     if (!note || typeof note !== 'object' || Array.isArray(note)
       || typeof note.id !== 'string' || noteIds.has(note.id)
@@ -667,47 +709,84 @@ function parseBackupArchive(archivePath) {
         error.status = 400;
         throw error;
       }
+      if (!ticketUploadNames.has(note.ticketId)) ticketUploadNames.set(note.ticketId, new Set());
+      if (!ticketUploadNames.get(note.ticketId).has(fileName)) {
+        ticketUploadNames.get(note.ticketId).add(fileName);
+        const totalSize = (ticketUploadSizes.get(note.ticketId) || 0) + uploadSizes.get(fileName);
+        if (totalSize > MAX_TOTAL_ATTACHMENT_SIZE) {
+          const error = new Error('The backup contains more than 12 MB of attachments for one ticket.');
+          error.status = 400;
+          throw error;
+        }
+        ticketUploadSizes.set(note.ticketId, totalSize);
+      }
     }
   }
   return { tickets: normalizedTickets.tickets, notes, uploadFiles };
 }
 
-function persistUploadedFiles(filesToSave) {
-  const saved = [];
-  try {
-    for (const file of filesToSave) {
-      const mimeType = file.normalizedMimeType || file.mimetype.toLowerCase().split(';', 1)[0];
-      const extension = MIME_EXTENSIONS.get(mimeType);
-      if (!extension) {
-        const error = new Error('Unsupported attachment type.');
-        error.status = 400;
-        throw error;
-      }
-      const fileName = `${crypto.randomUUID()}${extension}`;
-      fs.writeFileSync(path.join(UPLOAD_DIR, fileName), file.buffer, { flag: 'wx' });
-      saved.push({
-        fileName,
-        name: path.basename(file.originalname || fileName).slice(0, 200),
-        mimeType,
-        size: file.size,
-      });
+async function persistUploadedFiles(filesToSave, ticketId) {
+  const attachments = filesToSave.map((file) => {
+    const contentType = file.normalizedMimeType || file.mimetype.toLowerCase().split(';', 1)[0];
+    const extension = MIME_EXTENSIONS.get(contentType);
+    if (!extension) {
+      const error = new Error('Unsupported attachment type.');
+      error.status = 400;
+      throw error;
     }
-    return saved;
-  } catch (error) {
-    removeAttachmentFiles(saved);
+    const fileName = `${crypto.randomUUID()}${extension}`;
+    return {
+      fileName,
+      name: path.basename(file.originalname || fileName).slice(0, 200),
+      contentType,
+      data: file.buffer,
+      size: file.size,
+    };
+  });
+  const ticket = await Ticket.findById(ticketId).select('attachments.size').lean();
+  if (!ticket) {
+    const error = new Error('Ticket not found.');
+    error.status = 404;
     throw error;
   }
-}
-
-function removeAttachmentFiles(notes) {
-  for (const note of notes) {
-    for (const attachment of note.attachments || []) {
-      if (typeof attachment.fileName !== 'string') continue;
-      const fileName = path.basename(attachment.fileName);
-      if (fileName !== attachment.fileName) continue;
-      fs.rmSync(path.join(UPLOAD_DIR, fileName), { force: true });
+  const existingSize = (ticket.attachments || []).reduce((total, attachment) => total + attachment.size, 0);
+  const uploadedSize = attachments.reduce((total, attachment) => total + attachment.size, 0);
+  if (existingSize + uploadedSize > MAX_TOTAL_ATTACHMENT_SIZE) {
+    const error = new Error('A ticket cannot contain more than 12 MB of attachments.');
+    error.status = 413;
+    throw error;
+  }
+  if (attachments.length) {
+    const update = await Ticket.updateOne({ _id: ticketId }, {
+      $push: { attachments: { $each: attachments } },
+    });
+    if (!update.matchedCount) {
+      const error = new Error('Ticket not found.');
+      error.status = 404;
+      throw error;
     }
   }
+  return attachments.map(({ fileName, name, contentType, size }) => ({
+    fileName,
+    name,
+    mimeType: contentType,
+    size,
+  }));
+}
+
+async function removeAttachmentFiles(notes) {
+  const filesByTicket = new Map();
+  for (const note of notes) {
+    for (const attachment of note.attachments || []) {
+      if (typeof note.ticketId !== 'string' || typeof attachment.fileName !== 'string') continue;
+      if (!filesByTicket.has(note.ticketId)) filesByTicket.set(note.ticketId, []);
+      filesByTicket.get(note.ticketId).push(attachment.fileName);
+    }
+  }
+  await Promise.all([...filesByTicket].map(([ticketId, fileNames]) =>
+    Ticket.updateOne({ _id: ticketId }, {
+      $pull: { attachments: { fileName: { $in: fileNames } } },
+    })));
 }
 
 function masterPasswordFromRequest(req) {
@@ -807,9 +886,11 @@ app.get('/api/backup/export', async (req, res, next) => {
     const zip = new AdmZip();
     zip.addFile('data/tickets.json', Buffer.from(`${JSON.stringify(await getTickets(), null, 2)}\n`));
     zip.addFile('data/notes.json', fs.readFileSync(files.notes));
-    for (const entry of fs.readdirSync(UPLOAD_DIR, { withFileTypes: true })) {
-      if (!entry.isFile()) continue;
-      zip.addFile(`public/uploads/${entry.name}`, fs.readFileSync(path.join(UPLOAD_DIR, entry.name)));
+    const tickets = await Ticket.find({}).select('attachments');
+    for (const ticket of tickets) {
+      for (const attachment of ticket.attachments || []) {
+        zip.addFile(`public/uploads/${attachment.fileName}`, Buffer.from(attachment.data));
+      }
     }
     const filename = `sentinel-backup-${new Date().toISOString().slice(0, 10)}.zip`;
     res.attachment(filename);
@@ -821,11 +902,6 @@ app.get('/api/backup/export', async (req, res, next) => {
 });
 
 app.post('/api/backup/import', receiveBackupUpload, async (req, res, next) => {
-  let stagedUploadsDir;
-  let previousUploadsDir;
-  let previousUploadsMoved = false;
-  let stagedUploadsInstalled = false;
-  let committed = false;
   try {
     if (!req.file) {
       const error = new Error('Select a ZIP backup file to import.');
@@ -837,26 +913,35 @@ app.post('/api/backup/import', receiveBackupUpload, async (req, res, next) => {
     }
 
     const { tickets, notes, uploadFiles } = parseBackupArchive(req.file.path);
-    const backupId = crypto.randomUUID();
-    stagedUploadsDir = path.join(path.dirname(UPLOAD_DIR), `.sentinel-backup-stage-${backupId}`);
-    previousUploadsDir = path.join(path.dirname(UPLOAD_DIR), `.sentinel-backup-previous-${backupId}`);
-    fs.mkdirSync(stagedUploadsDir);
-    for (const uploadFile of uploadFiles) {
-      fs.writeFileSync(path.join(stagedUploadsDir, uploadFile.fileName), uploadFile.data, { flag: 'wx' });
+    const uploadsByName = new Map(uploadFiles.map((file) => [file.fileName, file.data]));
+    const ticketAttachments = new Map();
+    for (const note of notes) {
+      if (!ticketAttachments.has(note.ticketId)) ticketAttachments.set(note.ticketId, []);
+      for (const attachment of note.attachments || []) {
+        const data = uploadsByName.get(attachment.fileName);
+        if (!data) continue;
+        ticketAttachments.get(note.ticketId).push({
+          fileName: attachment.fileName,
+          name: attachment.name || attachment.fileName,
+          contentType: attachment.mimeType,
+          data,
+          size: data.length,
+        });
+      }
     }
-
-    fs.renameSync(UPLOAD_DIR, previousUploadsDir);
-    previousUploadsMoved = true;
-    fs.renameSync(stagedUploadsDir, UPLOAD_DIR);
-    stagedUploadsDir = null;
-    stagedUploadsInstalled = true;
+    const ticketsWithAttachments = tickets.map((ticket) => ({
+      ...ticket,
+      attachments: ticketAttachments.get(ticket.id) || [],
+    }));
     const previousNotes = getNotes();
     const session = await mongoose.startSession();
     let notesReplaced = false;
     try {
       await session.withTransaction(async () => {
         await Ticket.deleteMany({}, { session });
-        if (tickets.length) await Ticket.insertMany(tickets.map(toMongoTicket), { session });
+        if (ticketsWithAttachments.length) {
+          await Ticket.insertMany(ticketsWithAttachments.map(toMongoTicket), { session });
+        }
         atomicWriteJson(files.notes, notes);
         notesReplaced = true;
       });
@@ -872,34 +957,11 @@ app.post('/api/backup/import', receiveBackupUpload, async (req, res, next) => {
     } finally {
       await session.endSession();
     }
-    committed = true;
-
-    try {
-      fs.rmSync(previousUploadsDir, { recursive: true, force: true });
-    } catch (cleanupError) {
-      console.error(`Unable to remove previous attachment files after backup import: ${cleanupError.message}`);
-    }
     return res.json({ message: 'Backup imported successfully.' });
   } catch (error) {
-    if (!committed) {
-      if (stagedUploadsInstalled) {
-        try {
-          fs.rmSync(UPLOAD_DIR, { recursive: true, force: true });
-        } catch (rollbackError) {
-          console.error(`Unable to remove staged attachment files after failed backup import: ${rollbackError.message}`);
-        }
-      }
-      if (previousUploadsMoved) {
-        try {
-          fs.renameSync(previousUploadsDir, UPLOAD_DIR);
-        } catch (rollbackError) {
-          console.error(`Unable to restore attachment files after failed backup import: ${rollbackError.message}`);
-        }
-      }
-    }
     return next(error);
   } finally {
-    for (const temporaryPath of [stagedUploadsDir, req.backupTempDir]) {
+    for (const temporaryPath of [req.backupTempDir]) {
       if (!temporaryPath) continue;
       try {
         fs.rmSync(temporaryPath, { recursive: true, force: true });
@@ -1287,7 +1349,6 @@ app.post('/api/tickets/bulk-delete', async (req, res, next) => {
     } finally {
       await session.endSession();
     }
-    removeAttachmentFiles(deletedNotes);
     return res.json({ deletedCount: documents.length });
   } catch (error) {
     return next(error);
@@ -1325,7 +1386,6 @@ app.delete('/api/tickets/:id', async (req, res, next) => {
     } finally {
       await session.endSession();
     }
-    removeAttachmentFiles(deletedNotes);
     return res.status(204).end();
   } catch (error) {
     return next(error);
@@ -1357,17 +1417,19 @@ app.get('/api/notes/:ticketId', async (req, res, next) => {
 
 app.post('/api/notes', upload.array('attachments', MAX_FILES_PER_NOTE), async (req, res, next) => {
   let savedAttachments = [];
+  let ticketId;
   try {
-    const { ticketId, text = '' } = req.body || {};
+    ({ ticketId } = req.body || {});
+    const { text = '' } = req.body || {};
     if (typeof ticketId !== 'string' || !ticketId.trim() || !(await Ticket.exists({ _id: ticketId }))) {
       return res.status(400).json({ error: 'Select a valid ticket before adding a note.' });
     }
     if (typeof text !== 'string' || text.length > 10000) {
       return res.status(400).json({ error: 'Note text must be at most 10,000 characters.' });
     }
-    savedAttachments = persistUploadedFiles(req.files || []);
+    savedAttachments = await persistUploadedFiles(req.files || [], ticketId);
     if (!text.trim() && savedAttachments.length === 0) {
-      removeAttachmentFiles([{ attachments: savedAttachments }]);
+      await removeAttachmentFiles([{ ticketId, attachments: savedAttachments }]);
       return res.status(400).json({ error: 'Add note text or at least one attachment.' });
     }
     const note = {
@@ -1384,7 +1446,13 @@ app.post('/api/notes', upload.array('attachments', MAX_FILES_PER_NOTE), async (r
     atomicWriteJson(files.notes, notes);
     return res.status(201).json(note);
   } catch (error) {
-    removeAttachmentFiles([{ attachments: savedAttachments }]);
+    if (ticketId && savedAttachments.length) {
+      try {
+        await removeAttachmentFiles([{ ticketId, attachments: savedAttachments }]);
+      } catch (cleanupError) {
+        console.error(`Unable to remove unreferenced MongoDB attachments: ${cleanupError.message}`);
+      }
+    }
     return next(error);
   }
 });
@@ -1408,7 +1476,7 @@ app.put('/api/notes/:id', (req, res, next) => {
   }
 });
 
-app.delete('/api/notes/:id', (req, res, next) => {
+app.delete('/api/notes/:id', async (req, res, next) => {
   if (!masterPasswordMatches(masterPasswordFromRequest(req))) {
     return res.status(403).json({ error: 'Incorrect Master Password. Access Denied.' });
   }
@@ -1417,39 +1485,39 @@ app.delete('/api/notes/:id', (req, res, next) => {
     const note = notes.find((candidate) => candidate.id === req.params.id);
     if (!note) return res.status(404).json({ error: 'Note not found.' });
     atomicWriteJson(files.notes, notes.filter((candidate) => candidate.id !== note.id));
-    removeAttachmentFiles([note]);
+    await removeAttachmentFiles([note]);
     return res.status(204).end();
   } catch (error) {
     return next(error);
   }
 });
 
-app.get('/api/uploads/:fileName', (req, res, next) => {
+async function getStoredFile(req, res, next) {
   try {
-    const fileName = path.basename(req.params.fileName);
-    if (fileName !== req.params.fileName || !/^[\da-f-]{36}\.[a-z0-9]+$/i.test(fileName)) {
+    const fileName = req.params.fileId || req.params.fileName;
+    if (!/^[\da-f-]{36}\.[a-z0-9]+$/i.test(fileName)) {
       return res.status(404).json({ error: 'Attachment not found.' });
     }
-    const isAttached = getNotes().some((note) =>
-      (note.attachments || []).some((attachment) => attachment.fileName === fileName),
-    );
     const extension = path.extname(fileName).toLowerCase();
-    if (!isAttached || !EXTENSION_MIMES.has(extension)) {
+    if (!EXTENSION_MIMES.has(extension)) {
       return res.status(404).json({ error: 'Attachment not found.' });
     }
-    return res.sendFile(path.join(UPLOAD_DIR, fileName), {
-      headers: {
-        'Content-Type': EXTENSION_MIMES.get(extension),
-        'Content-Disposition': 'inline',
-        'X-Content-Type-Options': 'nosniff',
-      },
-    }, (error) => {
-      if (error && !res.headersSent) next(error);
-    });
+    const ticket = await Ticket.findOne({ 'attachments.fileName': fileName })
+      .select({ 'attachments.$': 1 });
+    const attachment = ticket?.attachments?.[0];
+    if (!attachment) return res.status(404).json({ error: 'Attachment not found.' });
+    return res.type(EXTENSION_MIMES.get(extension)).set({
+      'Content-Disposition': 'inline',
+      'X-Content-Type-Options': 'nosniff',
+      'Cache-Control': 'private, no-store',
+    }).send(Buffer.from(attachment.data));
   } catch (error) {
     return next(error);
   }
-});
+}
+
+app.get('/api/files/:fileId', getStoredFile);
+app.get('/api/uploads/:fileName', getStoredFile);
 
 app.get('/api/gallery', (req, res, next) => {
   try {
@@ -1458,7 +1526,7 @@ app.get('/api/gallery', (req, res, next) => {
         .filter((attachment) => attachment.mimeType.startsWith('image/'))
         .map((attachment) => ({
           ...attachment,
-          apiPath: `/api/uploads/${encodeURIComponent(attachment.fileName)}`,
+          apiPath: `/api/files/${encodeURIComponent(attachment.fileName)}`,
           ticketId: note.ticketId,
           createdAt: note.createdAt,
           text: note.text,

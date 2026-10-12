@@ -1544,7 +1544,6 @@ async function getStoredFile(req, res, next) {
       .select({ 'attachments.$': 1 });
     const attachment = ticket?.attachments?.[0];
     if (!attachment) return res.status(404).json({ error: 'Attachment not found.' });
-    const attachment = ticket?.attachments?.find((entry) => entry.fileName === fileName);
     if (!attachment || !attachment.data) return res.status(404).json({ error: 'Attachment not found.' });
     const contentType = EXTENSION_MIMES.get(extension);
     let data;

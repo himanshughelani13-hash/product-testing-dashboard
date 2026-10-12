@@ -1,21 +1,15 @@
 const express = require('express');
 require('dotenv').config();
-const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const os = require('node:os');
 const multer = require('multer');
 const AdmZip = require('adm-zip');
 const mongoose = require('mongoose');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
-const DATA_DIR = path.join(__dirname, 'data');
 const PUBLIC_DIR = path.join(__dirname, 'public');
-const PUBLIC_UPLOAD_DIR = path.join(PUBLIC_DIR, 'uploads');
 const PUBLIC_IMAGE_DIR = path.join(PUBLIC_DIR, 'images');
-const STORAGE_DIR = process.env.STORAGE_DIR ? path.resolve(process.env.STORAGE_DIR) : DATA_DIR;
-const UPLOAD_DIR = process.env.STORAGE_DIR ? path.join(STORAGE_DIR, 'uploads') : PUBLIC_UPLOAD_DIR;
 const MONGODB_URI = process.env.MONGODB_URI || process.env.MONGODB_ATLAS_URI;
 const MASTER_PASSWORD = 'cat123123';
 const DEFAULT_USERNAME = 'Admin';
@@ -38,18 +32,6 @@ const MAX_TOTAL_ATTACHMENT_SIZE = 12 * 1024 * 1024;
 const MAX_BACKUP_SIZE = 250 * 1024 * 1024;
 const MAX_BACKUP_CONTENT_SIZE = 500 * 1024 * 1024;
 const MAX_BACKUP_ENTRIES = 5000;
-
-for (const directory of [DATA_DIR, PUBLIC_IMAGE_DIR, STORAGE_DIR]) {
-  fs.mkdirSync(directory, { recursive: true });
-}
-
-const files = {
-  users: path.join(STORAGE_DIR, 'users.json'),
-  tickets: path.join(STORAGE_DIR, 'tickets.json'),
-  notes: path.join(STORAGE_DIR, 'notes.json'),
-  legacy: path.join(STORAGE_DIR, 'store.json'),
-  secret: path.join(STORAGE_DIR, 'auth-secret'),
-};
 
 const MIME_EXTENSIONS = new Map([
   ['image/png', '.png'],
@@ -107,28 +89,37 @@ const ticketSchema = new mongoose.Schema({
   collection: 'tickets',
 });
 const Ticket = mongoose.models.Ticket || mongoose.model('Ticket', ticketSchema);
-const migrationSchema = new mongoose.Schema({
+const noteSchema = new mongoose.Schema({
   _id: { type: String, required: true },
-  completedAt: { type: Date, required: true },
-}, { versionKey: false, collection: 'migrations' });
-const Migration = mongoose.models.Migration || mongoose.model('Migration', migrationSchema);
-
-function atomicWriteJson(filePath, value) {
-  const temporaryPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  fs.writeFileSync(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  try {
-    fs.renameSync(temporaryPath, filePath);
-  } catch (error) {
-    fs.rmSync(temporaryPath, { force: true });
-    throw error;
-  }
-}
-
-function readJson(filePath, defaultValue) {
-  if (!fs.existsSync(filePath)) return defaultValue;
-  const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-  return parsed;
-}
+  ticketId: { type: String, required: true, index: true },
+  text: { type: String, required: true },
+  attachments: { type: [{
+    fileName: { type: String, required: true },
+    name: { type: String, required: true },
+    mimeType: { type: String, required: true },
+    size: { type: Number, required: true },
+  }], default: [] },
+  createdAt: { type: Date, required: true },
+  updatedAt: { type: Date, required: true },
+  author: { type: String, required: true },
+  updatedBy: String,
+}, { versionKey: false, collection: 'notes' });
+const Note = mongoose.models.Note || mongoose.model('Note', noteSchema);
+const userSchema = new mongoose.Schema({
+  username: { type: String, required: true },
+  usernameNormalized: { type: String, required: true, unique: true },
+  role: { type: String, required: true },
+  salt: { type: String, required: true },
+  passwordHash: { type: String, required: true },
+  createdAt: { type: Date, required: true },
+}, { versionKey: false, collection: 'users' });
+const User = mongoose.models.User || mongoose.model('User', userSchema);
+const appMetadataSchema = new mongoose.Schema({
+  _id: { type: String, required: true },
+  value: { type: Buffer, required: true },
+}, { versionKey: false, collection: 'app_metadata' });
+const AppMetadata = mongoose.models.AppMetadata || mongoose.model('AppMetadata', appMetadataSchema);
+let authSecret;
 
 function createTicketId(existingTickets) {
   let id;
@@ -230,109 +221,14 @@ function masterPasswordMatches(password) {
   return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
 }
 
-function newDefaultUsers() {
-  return [{
+function newDefaultUser() {
+  return {
     username: DEFAULT_USERNAME,
+    usernameNormalized: DEFAULT_USERNAME.toLowerCase(),
     role: 'admin',
     ...hashPassword(DEFAULT_PASSWORD),
-    createdAt: new Date().toISOString(),
-  }];
-}
-
-function legacyData() {
-  try {
-    const legacy = readJson(files.legacy, { tickets: [], notes: [] });
-    return {
-      tickets: Array.isArray(legacy.tickets) ? legacy.tickets : [],
-      notes: Array.isArray(legacy.notes) ? legacy.notes : [],
-    };
-  } catch (error) {
-    console.error(`Unable to read legacy store for migration: ${error.message}`);
-    return { tickets: [], notes: [] };
-  }
-}
-
-const legacy = legacyData();
-let initialTickets = readJson(files.tickets, null);
-let initialNotes = readJson(files.notes, null);
-if (!initialTickets || !initialNotes) {
-  const moduleIds = new Map();
-  if (!initialTickets) {
-    initialTickets = [];
-    for (const ticket of legacy.tickets) {
-      const converted = {
-        id: createTicketId(initialTickets),
-        product: DEFAULT_PRODUCT,
-        title: typeof ticket.title === 'string' ? ticket.title : 'Legacy audit ticket',
-        description: typeof ticket.description === 'string' ? ticket.description : '',
-        status: 'Open',
-        createdAt: ticket.createdAt || new Date().toISOString(),
-        author: 'Legacy import',
-      };
-      if (typeof ticket.moduleId === 'string') moduleIds.set(ticket.moduleId, converted.id);
-      initialTickets.push(converted);
-    }
-  }
-  if (!initialNotes) {
-    initialNotes = legacy.notes.flatMap((note) => {
-      const ticketId = moduleIds.get(note.moduleId);
-      if (!ticketId) return [];
-      const attachments = Array.isArray(note.attachments) ? note.attachments.flatMap((attachment) => {
-        const fileName = path.basename(attachment.url || '');
-        if (!fileName || !fs.existsSync(path.join(UPLOAD_DIR, fileName))) return [];
-        return [{
-          fileName,
-          name: typeof attachment.name === 'string' ? attachment.name : fileName,
-          mimeType: attachment.mimeType || EXTENSION_MIMES.get(path.extname(fileName)) || 'application/octet-stream',
-          size: fs.statSync(path.join(UPLOAD_DIR, fileName)).size,
-        }];
-      }) : [];
-      return [{
-        id: note.id || crypto.randomUUID(),
-        ticketId,
-        text: typeof note.text === 'string' ? note.text : '',
-        attachments,
-        createdAt: note.createdAt || new Date().toISOString(),
-        updatedAt: note.createdAt || new Date().toISOString(),
-        author: 'Legacy import',
-      }];
-    });
-  }
-  if (!fs.existsSync(files.tickets)) atomicWriteJson(files.tickets, initialTickets);
-  if (!fs.existsSync(files.notes)) atomicWriteJson(files.notes, initialNotes);
-}
-if (!Array.isArray(initialTickets) || !Array.isArray(initialNotes)) {
-  throw new Error('Tickets and notes storage must contain JSON arrays.');
-}
-const normalizedInitialTickets = normalizeTicketProducts(initialTickets);
-const normalizedInitialActivityLogs = normalizeTicketActivityLogs(normalizedInitialTickets.tickets);
-initialTickets = normalizedInitialActivityLogs.tickets;
-if (normalizedInitialTickets.changed || normalizedInitialActivityLogs.changed) {
-  atomicWriteJson(files.tickets, initialTickets);
-}
-
-const storedUsers = readJson(files.users, []);
-let users = Array.isArray(storedUsers) ? storedUsers : [];
-const storedDefaultAdmin = users.find((user) =>
-  typeof user.username === 'string' && user.username.toLowerCase() === DEFAULT_USERNAME.toLowerCase(),
-);
-const defaultAdmin = storedDefaultAdmin && passwordMatches(DEFAULT_PASSWORD, storedDefaultAdmin)
-  ? storedDefaultAdmin
-  : newDefaultUsers()[0];
-users = [defaultAdmin, ...users.filter((user) =>
-  typeof user.username === 'string' && user.username.toLowerCase() !== DEFAULT_USERNAME.toLowerCase(),
-)];
-if (!Array.isArray(storedUsers) || !storedDefaultAdmin || defaultAdmin !== storedDefaultAdmin || users.length !== storedUsers.length) {
-  atomicWriteJson(files.users, users);
-}
-
-let authSecret;
-if (fs.existsSync(files.secret)) {
-  authSecret = fs.readFileSync(files.secret);
-  if (authSecret.length < 32) throw new Error('The stored auth-secret is invalid.');
-} else {
-  authSecret = crypto.randomBytes(48);
-  fs.writeFileSync(files.secret, authSecret, { mode: 0o600, flag: 'wx' });
+    createdAt: new Date(),
+  };
 }
 
 function toMongoTicket(ticket) {
@@ -376,46 +272,25 @@ async function initializeMongo() {
   }
   await mongoose.connect(MONGODB_URI);
   console.log('Connected to MongoDB Atlas successfully');
-  try {
-    await Ticket.createCollection();
-  } catch (error) {
-    if (error.code !== 48) throw error;
-  }
-
-  const migrationId = 'legacy-json-tickets-v1';
-  if (!(await Migration.exists({ _id: migrationId }))) {
-    if (!(await Ticket.exists({})) && initialTickets.length) {
-      await Ticket.insertMany(initialTickets.map(toMongoTicket));
+  for (const Model of [Ticket, Note]) {
+    try {
+      await Model.createCollection();
+    } catch (error) {
+      if (error.code !== 48) throw error;
     }
-    await Migration.create({ _id: migrationId, completedAt: new Date() });
   }
-
-  const attachmentMigrationId = 'legacy-upload-files-to-mongodb-v1';
-  if (!(await Migration.exists({ _id: attachmentMigrationId }))) {
-    for (const note of getNotes()) {
-      const legacyAttachments = [];
-      for (const attachment of note.attachments || []) {
-        const fileName = attachment.fileName;
-        const filePath = typeof fileName === 'string' ? path.join(UPLOAD_DIR, path.basename(fileName)) : '';
-        if (!fileName || path.basename(fileName) !== fileName || !fs.existsSync(filePath)) continue;
-        const contentType = attachment.mimeType || EXTENSION_MIMES.get(path.extname(fileName).toLowerCase());
-        if (!contentType) continue;
-        legacyAttachments.push({
-          fileName,
-          name: attachment.name || fileName,
-          contentType,
-          data: fs.readFileSync(filePath),
-          size: fs.statSync(filePath).size,
-        });
-      }
-      if (legacyAttachments.length) {
-        await Ticket.updateOne({ _id: note.ticketId }, {
-          $push: { attachments: { $each: legacyAttachments } },
-        });
-      }
-    }
-    await Migration.create({ _id: attachmentMigrationId, completedAt: new Date() });
-  }
+  await User.updateOne(
+    { usernameNormalized: DEFAULT_USERNAME.toLowerCase() },
+    { $setOnInsert: newDefaultUser() },
+    { upsert: true },
+  );
+  const metadata = await AppMetadata.findOneAndUpdate(
+    { _id: 'auth-secret' },
+    { $setOnInsert: { value: crypto.randomBytes(48) } },
+    { upsert: true, new: true },
+  ).lean();
+  authSecret = Buffer.from(metadata.value);
+  if (authSecret.length < 32) throw new Error('The stored auth-secret is invalid.');
 }
 
 function normalizedTicketStatus(value) {
@@ -466,16 +341,18 @@ function filterTickets(tickets, query) {
   });
 }
 
-function getNotes() {
-  const result = readJson(files.notes, []);
-  if (!Array.isArray(result)) throw new Error('notes.json must contain an array.');
-  return result;
+async function getNotes() {
+  return Note.find({}).lean();
 }
 
 function toApiNote(note) {
+  const { _id, __v, ...fields } = note;
   return {
-    ...note,
-    attachments: (note.attachments || []).map((attachment) => {
+    ...fields,
+    id: String(_id || note.id),
+    createdAt: new Date(note.createdAt).toISOString(),
+    updatedAt: new Date(note.updatedAt).toISOString(),
+    attachments: (fields.attachments || []).map((attachment) => {
       const fileName = typeof attachment.fileName === 'string'
         ? attachment.fileName
         : path.basename(attachment.url || '');
@@ -487,19 +364,13 @@ function toApiNote(note) {
   };
 }
 
-function getUsers() {
-  const result = readJson(files.users, []);
-  if (!Array.isArray(result)) throw new Error('users.json must contain an array.');
-  return result;
-}
-
 function signToken(username) {
   const payload = Buffer.from(JSON.stringify({ username })).toString('base64url');
   const signature = crypto.createHmac('sha256', authSecret).update(payload).digest('base64url');
   return `${payload}.${signature}`;
 }
 
-function verifyToken(token) {
+async function verifyToken(token) {
   if (typeof token !== 'string') return null;
   const [payload, signature, extra] = token.split('.');
   if (!payload || !signature || extra) return null;
@@ -513,19 +384,23 @@ function verifyToken(token) {
   if (expected.length !== supplied.length || !crypto.timingSafeEqual(expected, supplied)) return null;
   try {
     const claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
-    return getUsers().find((user) => user.username === claims.username) || null;
+    return await User.findOne({ username: claims.username }).lean();
   } catch {
     return null;
   }
 }
 
-function requireAuthentication(req, res, next) {
+async function requireAuthentication(req, res, next) {
   const authorization = req.get('authorization') || '';
   const match = authorization.match(/^Bearer ([^\s]+)$/);
-  const user = match ? verifyToken(match[1]) : null;
-  if (!user) return res.status(401).json({ error: 'Please sign in to continue.' });
-  req.user = { username: user.username, role: user.role || 'auditor' };
-  return next();
+  try {
+    const user = match ? await verifyToken(match[1]) : null;
+    if (!user) return res.status(401).json({ error: 'Please sign in to continue.' });
+    req.user = { username: user.username, role: user.role || 'auditor' };
+    return next();
+  } catch (error) {
+    return next(error);
+  }
 }
 
 const upload = multer({
@@ -544,14 +419,7 @@ const upload = multer({
 });
 
 const backupUpload = multer({
-  storage: multer.diskStorage({
-    destination(req, file, callback) {
-      callback(null, req.backupTempDir);
-    },
-    filename(req, file, callback) {
-      callback(null, `${crypto.randomUUID()}.zip`);
-    },
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: MAX_BACKUP_SIZE, files: 1, fields: 1, fieldSize: 1000 },
   fileFilter(req, file, callback) {
     if (path.extname(file.originalname).toLowerCase() !== '.zip') {
@@ -563,21 +431,6 @@ const backupUpload = multer({
   },
 });
 
-function receiveBackupUpload(req, res, next) {
-  req.backupTempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sentinel-backup-'));
-  backupUpload.single('backupFile')(req, res, (error) => {
-    if (error) {
-      try {
-        fs.rmSync(req.backupTempDir, { recursive: true, force: true });
-      } catch (cleanupError) {
-        console.error(`Unable to clean temporary backup upload: ${cleanupError.message}`);
-      }
-      return next(error);
-    }
-    return next();
-  });
-}
-
 function receiveNoteUploads(req, res, next) {
   upload.array('attachments', MAX_FILES_PER_NOTE)(req, res, (error) => {
     if (error) {
@@ -588,11 +441,11 @@ function receiveNoteUploads(req, res, next) {
   });
 }
 
-function parseBackupArchive(archivePath) {
+function parseBackupArchive(archiveData) {
   let zip;
   let entries;
   try {
-    zip = new AdmZip(archivePath);
+    zip = new AdmZip(archiveData);
     entries = zip.getEntries();
   } catch {
     const error = new Error('The uploaded file is not a valid ZIP backup.');
@@ -818,17 +671,17 @@ function masterPasswordFromRequest(req) {
   return req.get('x-master-password') || req.body?.masterAuthorizationPassword || req.body?.masterPassword;
 }
 
-app.use(express.json({ limit: '1mb' }));
-app.use(express.urlencoded({ extended: false, limit: '1mb' }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: false, limit: '50mb' }));
 app.use('/images', express.static(PUBLIC_IMAGE_DIR, { index: false, fallthrough: false }));
 
-app.post('/api/auth/login', (req, res, next) => {
+app.post('/api/auth/login', async (req, res, next) => {
   try {
     const { username, password } = req.body || {};
     if (typeof username !== 'string' || typeof password !== 'string') {
       return res.status(400).json({ error: 'Username and password are required.' });
     }
-    const user = getUsers().find((candidate) => candidate.username.toLowerCase() === username.trim().toLowerCase());
+    const user = await User.findOne({ usernameNormalized: username.trim().toLowerCase() }).lean();
     if (!passwordMatches(password, user)) return res.status(401).json({ error: 'Incorrect username or password.' });
     return res.json({ token: signToken(user.username), user: { username: user.username } });
   } catch (error) {
@@ -836,7 +689,7 @@ app.post('/api/auth/login', (req, res, next) => {
   }
 });
 
-app.post('/api/auth/add-user', (req, res, next) => {
+app.post('/api/auth/add-user', async (req, res, next) => {
   try {
     const {
       username,
@@ -858,42 +711,41 @@ app.post('/api/auth/add-user', (req, res, next) => {
     if (typeof newUsername !== 'string' || !/^[A-Za-z0-9_.-]{2,40}$/.test(newUsername.trim())) {
       return res.status(400).json({ error: 'Username must be 2–40 letters, numbers, dots, dashes, or underscores.' });
     }
-    users = getUsers();
-    if (users.some((user) => user.username.toLowerCase() === newUsername.trim().toLowerCase())) {
+    const usernameNormalized = newUsername.trim().toLowerCase();
+    if (await User.exists({ usernameNormalized })) {
       return res.status(409).json({ error: 'That username already exists.' });
     }
     const user = {
       username: newUsername.trim(),
+      usernameNormalized,
       role: 'auditor',
       ...hashPassword(newPassword),
-      createdAt: new Date().toISOString(),
+      createdAt: new Date(),
     };
-    users.push(user);
-    atomicWriteJson(files.users, users);
+    await User.create(user);
     return res.status(201).json({ username: user.username });
   } catch (error) {
+    if (error.code === 11000) return res.status(409).json({ error: 'That username already exists.' });
     return next(error);
   }
 });
 
-app.post('/api/auth/reset', (req, res, next) => {
+app.post('/api/auth/reset', async (req, res, next) => {
   if (!masterPasswordMatches(masterPasswordFromRequest(req))) {
     return res.status(403).json({ error: 'Invalid Master Authorization Password.' });
   }
   try {
-    users = getUsers();
-    const defaultAdmin = users.find((user) =>
-      typeof user.username === 'string' && user.username.toLowerCase() === DEFAULT_USERNAME.toLowerCase(),
-    );
+    const defaultAdmin = await User.findOne({ usernameNormalized: DEFAULT_USERNAME.toLowerCase() }).lean();
     if (!defaultAdmin || !passwordMatches(DEFAULT_PASSWORD, defaultAdmin)) {
       throw new Error('Protected default administrator account is missing or invalid.');
     }
-    users = [defaultAdmin];
-    atomicWriteJson(files.users, users);
     authSecret = crypto.randomBytes(48);
-    const temporarySecret = `${files.secret}.${process.pid}.${crypto.randomUUID()}.tmp`;
-    fs.writeFileSync(temporarySecret, authSecret, { mode: 0o600, flag: 'wx' });
-    fs.renameSync(temporarySecret, files.secret);
+    await User.deleteMany({ usernameNormalized: { $ne: DEFAULT_USERNAME.toLowerCase() } });
+    await AppMetadata.updateOne(
+      { _id: 'auth-secret' },
+      { $set: { value: authSecret } },
+      { upsert: true },
+    );
     return res.json({ message: 'User accounts reset to the default administrator.' });
   } catch (error) {
     return next(error);
@@ -910,7 +762,8 @@ app.get('/api/backup/export', async (req, res, next) => {
   try {
     const zip = new AdmZip();
     zip.addFile('data/tickets.json', Buffer.from(`${JSON.stringify(await getTickets(), null, 2)}\n`));
-    zip.addFile('data/notes.json', fs.readFileSync(files.notes));
+    const notes = (await getNotes()).map(toApiNote);
+    zip.addFile('data/notes.json', Buffer.from(`${JSON.stringify(notes, null, 2)}\n`));
     const tickets = await Ticket.find({}).select('attachments');
     for (const ticket of tickets) {
       for (const attachment of ticket.attachments || []) {
@@ -926,7 +779,7 @@ app.get('/api/backup/export', async (req, res, next) => {
   }
 });
 
-app.post('/api/backup/import', receiveBackupUpload, async (req, res, next) => {
+app.post('/api/backup/import', backupUpload.single('backupFile'), async (req, res, next) => {
   try {
     if (!req.file) {
       const error = new Error('Select a ZIP backup file to import.');
@@ -937,7 +790,7 @@ app.post('/api/backup/import', receiveBackupUpload, async (req, res, next) => {
       return res.status(401).json({ error: 'Incorrect Master Password. Access Denied.' });
     }
 
-    const { tickets, notes, uploadFiles } = parseBackupArchive(req.file.path);
+    const { tickets, notes, uploadFiles } = parseBackupArchive(req.file.buffer);
     const uploadsByName = new Map(uploadFiles.map((file) => [file.fileName, file.data]));
     const ticketAttachments = new Map();
     for (const note of notes) {
@@ -958,26 +811,24 @@ app.post('/api/backup/import', receiveBackupUpload, async (req, res, next) => {
       ...ticket,
       attachments: ticketAttachments.get(ticket.id) || [],
     }));
-    const previousNotes = getNotes();
     const session = await mongoose.startSession();
-    let notesReplaced = false;
     try {
       await session.withTransaction(async () => {
         await Ticket.deleteMany({}, { session });
         if (ticketsWithAttachments.length) {
           await Ticket.insertMany(ticketsWithAttachments.map(toMongoTicket), { session });
         }
-        atomicWriteJson(files.notes, notes);
-        notesReplaced = true;
+        await Note.deleteMany({}, { session });
+        if (notes.length) {
+          await Note.insertMany(notes.map((note) => ({
+            ...note,
+            _id: note.id,
+            createdAt: new Date(note.createdAt),
+            updatedAt: new Date(note.updatedAt || note.createdAt),
+          })), { session });
+        }
       });
     } catch (error) {
-      if (notesReplaced) {
-        try {
-          atomicWriteJson(files.notes, previousNotes);
-        } catch (rollbackError) {
-          console.error(`Unable to restore notes after failed MongoDB backup import: ${rollbackError.message}`);
-        }
-      }
       throw error;
     } finally {
       await session.endSession();
@@ -986,14 +837,7 @@ app.post('/api/backup/import', receiveBackupUpload, async (req, res, next) => {
   } catch (error) {
     return next(error);
   } finally {
-    for (const temporaryPath of [req.backupTempDir]) {
-      if (!temporaryPath) continue;
-      try {
-        fs.rmSync(temporaryPath, { recursive: true, force: true });
-      } catch (cleanupError) {
-        console.error(`Unable to clean backup import temporary files: ${cleanupError.message}`);
-      }
-    }
+    req.file = undefined;
   }
 });
 
@@ -1009,7 +853,9 @@ app.get('/api/reports/summary', async (req, res, next) => {
   try {
     const tickets = filterTickets(await getTickets(), req.query);
     const ticketIds = new Set(tickets.map((ticket) => ticket.id));
-    const notes = getNotes().filter((note) => ticketIds.has(note.ticketId));
+    const notes = (await getNotes())
+      .filter((note) => ticketIds.has(note.ticketId))
+      .map(toApiNote);
     const notesByTicket = new Map();
     for (const note of notes) {
       if (!notesByTicket.has(note.ticketId)) notesByTicket.set(note.ticketId, []);
@@ -1351,26 +1197,12 @@ app.post('/api/tickets/bulk-delete', async (req, res, next) => {
       return res.status(404).json({ error: 'One or more selected tickets were not found.' });
     }
 
-    const notes = getNotes();
-    const deletedNotes = notes.filter((note) => ticketIds.includes(note.ticketId));
-    const nextNotes = notes.filter((note) => !ticketIds.includes(note.ticketId));
     const session = await mongoose.startSession();
-    let notesReplaced = false;
     try {
       await session.withTransaction(async () => {
         await Ticket.deleteMany({ _id: { $in: ticketIds } }, { session });
-        atomicWriteJson(files.notes, nextNotes);
-        notesReplaced = true;
+        await Note.deleteMany({ ticketId: { $in: ticketIds } }, { session });
       });
-    } catch (error) {
-      if (notesReplaced) {
-        try {
-          atomicWriteJson(files.notes, notes);
-        } catch (rollbackError) {
-          console.error(`Unable to restore notes after failed MongoDB bulk ticket deletion: ${rollbackError.message}`);
-        }
-      }
-      throw error;
     } finally {
       await session.endSession();
     }
@@ -1388,26 +1220,12 @@ app.delete('/api/tickets/:id', async (req, res, next) => {
     const ticketDocument = await Ticket.findById(req.params.id).lean();
     if (!ticketDocument) return res.status(404).json({ error: 'Ticket not found.' });
     const ticket = toApiTicket(ticketDocument);
-    const notes = getNotes();
-    const deletedNotes = notes.filter((note) => note.ticketId === ticket.id);
-    const nextNotes = notes.filter((note) => note.ticketId !== ticket.id);
     const session = await mongoose.startSession();
-    let notesReplaced = false;
     try {
       await session.withTransaction(async () => {
         await Ticket.findByIdAndDelete(ticket.id, { session });
-        atomicWriteJson(files.notes, nextNotes);
-        notesReplaced = true;
+        await Note.deleteMany({ ticketId: ticket.id }, { session });
       });
-    } catch (error) {
-      if (notesReplaced) {
-        try {
-          atomicWriteJson(files.notes, notes);
-        } catch (rollbackError) {
-          console.error(`Unable to restore notes after failed MongoDB ticket deletion: ${rollbackError.message}`);
-        }
-      }
-      throw error;
     } finally {
       await session.endSession();
     }
@@ -1417,10 +1235,10 @@ app.delete('/api/tickets/:id', async (req, res, next) => {
   }
 });
 
-app.get('/api/notes/counts', (req, res, next) => {
+app.get('/api/notes/counts', async (req, res, next) => {
   try {
     const counts = {};
-    for (const note of getNotes()) {
+    for (const note of await getNotes()) {
       counts[note.ticketId] = (counts[note.ticketId] || 0) + 1;
     }
     return res.json(counts);
@@ -1434,7 +1252,7 @@ app.get('/api/notes/:ticketId', async (req, res, next) => {
     if (!(await Ticket.exists({ _id: req.params.ticketId }))) {
       return res.status(404).json({ error: 'Ticket not found.' });
     }
-    return res.json(getNotes()
+    return res.json((await getNotes())
       .filter((note) => note.ticketId === req.params.ticketId)
       .map(toApiNote));
   } catch (error) {
@@ -1462,18 +1280,16 @@ app.post('/api/notes', receiveNoteUploads, async (req, res, next) => {
       ticketId,
       text: text.trim(),
       attachments: [],
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      createdAt: new Date(),
+      updatedAt: new Date(),
       author: req.user.username,
     };
-    const notes = getNotes();
-    notes.push(note);
-    atomicWriteJson(files.notes, notes);
+    await Note.create({ ...note, _id: note.id });
     let attachmentError = req.noteUploadError;
     if (!attachmentError && (req.files || []).length) {
       try {
         note.attachments = await persistUploadedFiles(req.files, ticketId);
-        atomicWriteJson(files.notes, notes);
+        await Note.updateOne({ _id: note.id }, { $set: { attachments: note.attachments } });
       } catch (error) {
         attachmentError = error;
         if (note.attachments.length) {
@@ -1495,20 +1311,18 @@ app.post('/api/notes', receiveNoteUploads, async (req, res, next) => {
   }
 });
 
-app.put('/api/notes/:id', (req, res, next) => {
+app.put('/api/notes/:id', async (req, res, next) => {
   try {
     const { text } = req.body || {};
     if (typeof text !== 'string' || text.length > 10000) {
       return res.status(400).json({ error: 'Note text must be a string of at most 10,000 characters.' });
     }
-    const notes = getNotes();
-    const note = notes.find((candidate) => candidate.id === req.params.id);
+    const note = await Note.findById(req.params.id).lean();
     if (!note) return res.status(404).json({ error: 'Note not found.' });
-    note.text = text.trim();
-    note.updatedAt = new Date().toISOString();
-    note.updatedBy = req.user.username;
-    atomicWriteJson(files.notes, notes);
-    return res.json(note);
+    const updatedNote = await Note.findByIdAndUpdate(req.params.id, {
+      $set: { text: text.trim(), updatedAt: new Date(), updatedBy: req.user.username },
+    }, { new: true }).lean();
+    return res.json(toApiNote(updatedNote));
   } catch (error) {
     return next(error);
   }
@@ -1519,10 +1333,9 @@ app.delete('/api/notes/:id', async (req, res, next) => {
     return res.status(403).json({ error: 'Incorrect Master Password. Access Denied.' });
   }
   try {
-    const notes = getNotes();
-    const note = notes.find((candidate) => candidate.id === req.params.id);
+    const note = await Note.findById(req.params.id).lean();
     if (!note) return res.status(404).json({ error: 'Note not found.' });
-    atomicWriteJson(files.notes, notes.filter((candidate) => candidate.id !== note.id));
+    await Note.deleteOne({ _id: note._id });
     await removeAttachmentFiles([note]);
     return res.status(204).end();
   } catch (error) {
@@ -1569,9 +1382,9 @@ async function getStoredFile(req, res, next) {
 app.get('/api/files/:fileId', getStoredFile);
 app.get('/api/uploads/:fileName', getStoredFile);
 
-app.get('/api/gallery', (req, res, next) => {
+app.get('/api/gallery', async (req, res, next) => {
   try {
-    const gallery = getNotes().flatMap((note) =>
+    const gallery = (await getNotes()).flatMap((note) =>
       (note.attachments || [])
         .filter((attachment) => attachment.mimeType.startsWith('image/'))
         .map((attachment) => ({
@@ -1612,13 +1425,16 @@ app.use((error, req, res, next) => {
   return res.status(status).json({ error: status >= 500 ? 'An internal server error occurred.' : error.message });
 });
 
-function startServer() {
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`SiyanoAV audit dashboard listening on 0.0.0.0:${PORT}`);
-  });
-  initializeMongo().catch((error) => {
+async function startServer() {
+  try {
+    await initializeMongo();
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`SiyanoAV audit dashboard listening on 0.0.0.0:${PORT}`);
+    });
+  } catch (error) {
     console.error(`Unable to connect to MongoDB Atlas at startup: ${error.message}`);
-  });
+    process.exitCode = 1;
+  }
 }
 
 startServer();

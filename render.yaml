@@ -5,13 +5,7 @@ services:
     plan: starter
     buildCommand: npm ci
     startCommand: npm start
-    disk:
-      name: product-testing-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
-      - key: STORAGE_DIR
-        value: /var/data
       - key: MONGODB_URI
         sync: false
       - key: NODE_VERSION

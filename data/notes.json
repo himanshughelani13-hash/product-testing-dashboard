@@ -382,5 +382,75 @@
     "createdAt": "2026-10-09T11:49:13.660Z",
     "updatedAt": "2026-10-09T11:49:13.660Z",
     "author": "Sanjay"
+  },
+  {
+    "id": "a367a43f-8354-43fb-9c29-00fff1d48484",
+    "ticketId": "TCK-C21B",
+    "text": "",
+    "attachments": [
+      {
+        "fileName": "1c658e8a-df5e-4079-a355-6ef079176fd7.webm",
+        "name": "voice-note-1791765972575.webm",
+        "mimeType": "audio/webm",
+        "size": 3894
+      }
+    ],
+    "createdAt": "2026-10-12T00:46:12.601Z",
+    "updatedAt": "2026-10-12T00:46:12.601Z",
+    "author": "Sanjay"
+  },
+  {
+    "id": "3cb777d5-fabc-4f72-9b68-e97915da6359",
+    "ticketId": "TCK-C21B",
+    "text": "ertger;lgyjer][perltg\r\n]er'g;e\r\nrg'erg\r\n\r\nergergertg\r\nertgerg\r\nerg\r\nerrtg\\\r\nergy\r\nergy",
+    "attachments": [
+      {
+        "fileName": "51ed6aa6-1b0d-4d19-9309-d6c937135955.pdf",
+        "name": "Executive Summary Audit Report.pdf",
+        "mimeType": "application/pdf",
+        "size": 1147158
+      }
+    ],
+    "createdAt": "2026-10-12T00:46:45.057Z",
+    "updatedAt": "2026-10-12T00:46:45.057Z",
+    "author": "Sanjay"
+  },
+  {
+    "id": "9886bc50-0b72-4c5d-a882-c05ece54879a",
+    "ticketId": "TCK-C21B",
+    "text": "",
+    "attachments": [
+      {
+        "fileName": "cec5817b-138c-49cd-bac3-31fa0949e6f7.jpg",
+        "name": "heritage-craftsmanship.jpg",
+        "mimeType": "image/jpeg",
+        "size": 179412
+      },
+      {
+        "fileName": "330f4178-6fde-4992-8f16-cac4eecc3b1a.jpg",
+        "name": "hero-bg.jpg",
+        "mimeType": "image/jpeg",
+        "size": 105079
+      }
+    ],
+    "createdAt": "2026-10-12T00:47:28.299Z",
+    "updatedAt": "2026-10-12T00:47:28.299Z",
+    "author": "Sanjay"
+  },
+  {
+    "id": "c0ffefdf-4fb3-4c5f-826c-f080f367ef9b",
+    "ticketId": "TCK-C21B",
+    "text": "",
+    "attachments": [
+      {
+        "fileName": "865455ef-5dad-4809-bfc8-db3f1c39a02e.jpg",
+        "name": "cat-saree.jpg",
+        "mimeType": "image/jpeg",
+        "size": 200398
+      }
+    ],
+    "createdAt": "2026-10-12T00:48:13.649Z",
+    "updatedAt": "2026-10-12T00:48:13.649Z",
+    "author": "Sanjay"
   }
 ]

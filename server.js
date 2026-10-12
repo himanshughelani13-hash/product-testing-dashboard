@@ -472,6 +472,21 @@ function getNotes() {
   return result;
 }
 
+function toApiNote(note) {
+  return {
+    ...note,
+    attachments: (note.attachments || []).map((attachment) => {
+      const fileName = typeof attachment.fileName === 'string'
+        ? attachment.fileName
+        : path.basename(attachment.url || '');
+      return {
+        ...attachment,
+        ...(fileName ? { url: `/api/files/${encodeURIComponent(fileName)}` } : {}),
+      };
+    }),
+  };
+}
+
 function getUsers() {
   const result = readJson(files.users, []);
   if (!Array.isArray(result)) throw new Error('users.json must contain an array.');
@@ -558,6 +573,16 @@ function receiveBackupUpload(req, res, next) {
         console.error(`Unable to clean temporary backup upload: ${cleanupError.message}`);
       }
       return next(error);
+    }
+    return next();
+  });
+}
+
+function receiveNoteUploads(req, res, next) {
+  upload.array('attachments', MAX_FILES_PER_NOTE)(req, res, (error) => {
+    if (error) {
+      req.noteUploadError = error;
+      req.files = req.files || [];
     }
     return next();
   });
@@ -1409,17 +1434,17 @@ app.get('/api/notes/:ticketId', async (req, res, next) => {
     if (!(await Ticket.exists({ _id: req.params.ticketId }))) {
       return res.status(404).json({ error: 'Ticket not found.' });
     }
-    return res.json(getNotes().filter((note) => note.ticketId === req.params.ticketId));
+    return res.json(getNotes()
+      .filter((note) => note.ticketId === req.params.ticketId)
+      .map(toApiNote));
   } catch (error) {
     return next(error);
   }
 });
 
-app.post('/api/notes', upload.array('attachments', MAX_FILES_PER_NOTE), async (req, res, next) => {
-  let savedAttachments = [];
-  let ticketId;
+app.post('/api/notes', receiveNoteUploads, async (req, res, next) => {
   try {
-    ({ ticketId } = req.body || {});
+    const { ticketId } = req.body || {};
     const { text = '' } = req.body || {};
     if (typeof ticketId !== 'string' || !ticketId.trim() || !(await Ticket.exists({ _id: ticketId }))) {
       return res.status(400).json({ error: 'Select a valid ticket before adding a note.' });
@@ -1427,16 +1452,16 @@ app.post('/api/notes', upload.array('attachments', MAX_FILES_PER_NOTE), async (r
     if (typeof text !== 'string' || text.length > 10000) {
       return res.status(400).json({ error: 'Note text must be at most 10,000 characters.' });
     }
-    savedAttachments = await persistUploadedFiles(req.files || [], ticketId);
-    if (!text.trim() && savedAttachments.length === 0) {
-      await removeAttachmentFiles([{ ticketId, attachments: savedAttachments }]);
+    if (!text.trim() && !(req.files || []).length) {
+      const error = req.noteUploadError;
+      if (error) return res.status(error.status || 400).json({ error: error.message });
       return res.status(400).json({ error: 'Add note text or at least one attachment.' });
     }
     const note = {
       id: crypto.randomUUID(),
       ticketId,
       text: text.trim(),
-      attachments: savedAttachments,
+      attachments: [],
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       author: req.user.username,
@@ -1444,15 +1469,28 @@ app.post('/api/notes', upload.array('attachments', MAX_FILES_PER_NOTE), async (r
     const notes = getNotes();
     notes.push(note);
     atomicWriteJson(files.notes, notes);
-    return res.status(201).json(note);
-  } catch (error) {
-    if (ticketId && savedAttachments.length) {
+    let attachmentError = req.noteUploadError;
+    if (!attachmentError && (req.files || []).length) {
       try {
-        await removeAttachmentFiles([{ ticketId, attachments: savedAttachments }]);
-      } catch (cleanupError) {
-        console.error(`Unable to remove unreferenced MongoDB attachments: ${cleanupError.message}`);
+        note.attachments = await persistUploadedFiles(req.files, ticketId);
+        atomicWriteJson(files.notes, notes);
+      } catch (error) {
+        attachmentError = error;
+        if (note.attachments.length) {
+          try {
+            await removeAttachmentFiles([note]);
+          } catch (cleanupError) {
+            console.error(`Unable to remove attachments from a note after attachment persistence failed: ${cleanupError.message}`);
+          }
+          note.attachments = [];
+        }
       }
     }
+    return res.status(201).json({
+      ...toApiNote(note),
+      ...(attachmentError ? { attachmentError: attachmentError.message } : {}),
+    });
+  } catch (error) {
     return next(error);
   }
 });
@@ -1506,11 +1544,24 @@ async function getStoredFile(req, res, next) {
       .select({ 'attachments.$': 1 });
     const attachment = ticket?.attachments?.[0];
     if (!attachment) return res.status(404).json({ error: 'Attachment not found.' });
-    return res.type(EXTENSION_MIMES.get(extension)).set({
+    const attachment = ticket?.attachments?.find((entry) => entry.fileName === fileName);
+    if (!attachment || !attachment.data) return res.status(404).json({ error: 'Attachment not found.' });
+    const contentType = EXTENSION_MIMES.get(extension);
+    let data;
+    if (Buffer.isBuffer(attachment.data)) {
+      data = attachment.data;
+    } else if (attachment.data instanceof Uint8Array) {
+      data = Buffer.from(attachment.data);
+    } else if (attachment.data?.buffer instanceof Uint8Array) {
+      data = Buffer.from(attachment.data.buffer).subarray(0, attachment.data.position || attachment.data.buffer.length);
+    } else {
+      return res.status(404).json({ error: 'Attachment not found.' });
+    }
+    return res.type(contentType).set({
       'Content-Disposition': 'inline',
       'X-Content-Type-Options': 'nosniff',
       'Cache-Control': 'private, no-store',
-    }).send(Buffer.from(attachment.data));
+    }).send(data);
   } catch (error) {
     return next(error);
   }

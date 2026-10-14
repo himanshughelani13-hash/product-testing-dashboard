@@ -7,10 +7,12 @@ const AdmZip = require('adm-zip');
 const mongoose = require('mongoose');
 
 const app = express();
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = Number(process.env.PORT) || 8080;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const PUBLIC_IMAGE_DIR = path.join(PUBLIC_DIR, 'images');
-const MONGODB_URI = process.env.MONGODB_URI || process.env.MONGODB_ATLAS_URI;
+const MONGODB_URI = [process.env.MONGODB_URI, process.env.MONGODB_ATLAS_URI]
+  .map((uri) => typeof uri === 'string' ? uri.trim() : '')
+  .find(Boolean);
 const MASTER_PASSWORD = 'cat123123';
 const DEFAULT_USERNAME = 'Admin';
 const DEFAULT_PASSWORD = 'admin@123#';
@@ -32,6 +34,8 @@ const MAX_TOTAL_ATTACHMENT_SIZE = 12 * 1024 * 1024;
 const MAX_BACKUP_SIZE = 250 * 1024 * 1024;
 const MAX_BACKUP_CONTENT_SIZE = 500 * 1024 * 1024;
 const MAX_BACKUP_ENTRIES = 5000;
+let databaseReady = false;
+let mongoInitialized = false;
 
 const MIME_EXTENSIONS = new Map([
   ['image/png', '.png'],
@@ -120,6 +124,14 @@ const appMetadataSchema = new mongoose.Schema({
 }, { versionKey: false, collection: 'app_metadata' });
 const AppMetadata = mongoose.models.AppMetadata || mongoose.model('AppMetadata', appMetadataSchema);
 let authSecret;
+
+mongoose.connection.on('disconnected', () => {
+  databaseReady = false;
+  console.error('MongoDB disconnected; database-backed API requests will return HTTP 503 until the connection is restored.');
+});
+mongoose.connection.on('connected', () => {
+  if (mongoInitialized) databaseReady = true;
+});
 
 function createTicketId(existingTickets) {
   let id;
@@ -268,10 +280,20 @@ async function getTickets() {
 
 async function initializeMongo() {
   if (!MONGODB_URI) {
-    throw new Error('Set MONGODB_URI or MONGODB_ATLAS_URI to your MongoDB Atlas connection string.');
+    throw new Error('MONGODB_URI is missing. Set it to a MongoDB connection string.');
   }
-  await mongoose.connect(MONGODB_URI);
-  console.log('Connected to MongoDB Atlas successfully');
+  if (!/^mongodb(?:\+srv)?:\/\/(?:[^@/?#]+@)?[^/?#]+(?:[/?#].*)?$/i.test(MONGODB_URI)) {
+    throw new Error('MONGODB_URI must be a valid mongodb:// or mongodb+srv:// connection string.');
+  }
+  if (mongoose.connection.readyState !== 1) {
+    await mongoose.connect(MONGODB_URI, {
+      serverSelectionTimeoutMS: 10000,
+      connectTimeoutMS: 10000,
+      socketTimeoutMS: 45000,
+      family: 4,
+    });
+  }
+  console.log('Connected to MongoDB successfully');
   for (const Model of [Ticket, Note]) {
     try {
       await Model.createCollection();
@@ -291,6 +313,8 @@ async function initializeMongo() {
   ).lean();
   authSecret = Buffer.from(metadata.value);
   if (authSecret.length < 32) throw new Error('The stored auth-secret is invalid.');
+  mongoInitialized = true;
+  databaseReady = true;
 }
 
 function normalizedTicketStatus(value) {
@@ -674,6 +698,12 @@ function masterPasswordFromRequest(req) {
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: false, limit: '50mb' }));
 app.use('/images', express.static(PUBLIC_IMAGE_DIR, { index: false, fallthrough: false }));
+app.use('/api', (req, res, next) => {
+  if (!databaseReady || mongoose.connection.readyState !== 1) {
+    return res.status(503).json({ error: 'Database is temporarily unavailable. Please try again shortly.' });
+  }
+  return next();
+});
 
 app.post('/api/auth/login', async (req, res, next) => {
   try {
@@ -1426,14 +1456,35 @@ app.use((error, req, res, next) => {
 });
 
 async function startServer() {
-  try {
-    await initializeMongo();
-    app.listen(PORT, '0.0.0.0', () => {
-      console.log(`SiyanoAV audit dashboard listening on 0.0.0.0:${PORT}`);
-    });
-  } catch (error) {
-    console.error(`Unable to connect to MongoDB Atlas at startup: ${error.message}`);
-    process.exitCode = 1;
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`SiyanoAV audit dashboard listening on 0.0.0.0:${PORT}`);
+  });
+
+  if (!MONGODB_URI) {
+    console.error('MongoDB configuration error: MONGODB_URI is missing. Set it to a MongoDB connection string.');
+    return;
+  }
+  if (!/^mongodb(?:\+srv)?:\/\/(?:[^@/?#]+@)?[^/?#]+(?:[/?#].*)?$/i.test(MONGODB_URI)) {
+    console.error('MongoDB configuration error: MONGODB_URI must be a valid mongodb:// or mongodb+srv:// connection string.');
+    return;
+  }
+
+  let attempt = 1;
+  let retryDelay = 5000;
+  while (!databaseReady) {
+    try {
+      await initializeMongo();
+      return;
+    } catch (error) {
+      console.error(`Unable to connect to MongoDB at startup (attempt ${attempt}): ${error.message}`);
+      console.error('The HTTP server remains available; MongoDB-backed API requests will return HTTP 503 while the database is unavailable.');
+      if (/querySrv.*ECONNREFUSED/i.test(error.message) && /^mongodb\+srv:\/\//i.test(MONGODB_URI)) {
+        console.error('This runtime cannot resolve the MongoDB SRV record. Configure MONGODB_URI with the standard mongodb:// seed-list URI from Atlas instead.');
+      }
+      await new Promise((resolve) => setTimeout(resolve, retryDelay));
+      retryDelay = Math.min(retryDelay * 2, 60000);
+      attempt += 1;
+    }
   }
 }
 

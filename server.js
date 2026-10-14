@@ -124,12 +124,19 @@ const appMetadataSchema = new mongoose.Schema({
 }, { versionKey: false, collection: 'app_metadata' });
 const AppMetadata = mongoose.models.AppMetadata || mongoose.model('AppMetadata', appMetadataSchema);
 let authSecret;
+let lastDatabaseError = null;
 
 mongoose.connection.on('disconnected', () => {
   databaseReady = false;
-  console.error('MongoDB disconnected; database-backed API requests will return HTTP 503 until the connection is restored.');
+  if (!lastDatabaseError) lastDatabaseError = new Error('MongoDB connection disconnected.');
+  console.error(`MongoDB disconnected: ${lastDatabaseError.message}`);
+});
+mongoose.connection.on('error', (error) => {
+  lastDatabaseError = error;
+  console.error('MongoDB connection error:', error);
 });
 mongoose.connection.on('connected', () => {
+  lastDatabaseError = null;
   if (mongoInitialized) databaseReady = true;
 });
 
@@ -314,6 +321,7 @@ async function initializeMongo() {
   authSecret = Buffer.from(metadata.value);
   if (authSecret.length < 32) throw new Error('The stored auth-secret is invalid.');
   mongoInitialized = true;
+  lastDatabaseError = null;
   databaseReady = true;
 }
 
@@ -700,7 +708,9 @@ app.use(express.urlencoded({ extended: false, limit: '50mb' }));
 app.use('/images', express.static(PUBLIC_IMAGE_DIR, { index: false, fallthrough: false }));
 app.use('/api', (req, res, next) => {
   if (!databaseReady || mongoose.connection.readyState !== 1) {
-    return res.status(503).json({ error: 'Database is temporarily unavailable. Please try again shortly.' });
+    return res.status(503).json({
+      error: lastDatabaseError?.message || 'MongoDB connection is not ready.',
+    });
   }
   return next();
 });
@@ -1433,6 +1443,11 @@ app.get('/api/gallery', async (req, res, next) => {
 
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'dashboard.html')));
 
+function isMongoDatabaseError(error) {
+  return error instanceof mongoose.Error
+    || (typeof error?.name === 'string' && /^(?:Mongoose|Mongo)/.test(error.name));
+}
+
 app.use((error, req, res, next) => {
   if (res.headersSent) return next(error);
   if (error instanceof multer.MulterError) {
@@ -1452,7 +1467,11 @@ app.use((error, req, res, next) => {
   }
   const status = Number.isInteger(error.status) ? error.status : 500;
   if (status >= 500) console.error(error);
-  return res.status(status).json({ error: status >= 500 ? 'An internal server error occurred.' : error.message });
+  return res.status(status).json({
+    error: status >= 500 && !isMongoDatabaseError(error)
+      ? 'An internal server error occurred.'
+      : error.message,
+  });
 });
 
 async function startServer() {
@@ -1461,11 +1480,13 @@ async function startServer() {
   });
 
   if (!MONGODB_URI) {
-    console.error('MongoDB configuration error: MONGODB_URI is missing. Set it to a MongoDB connection string.');
+    lastDatabaseError = new Error('MONGODB_URI is missing. Set it to a MongoDB connection string.');
+    console.error(`MongoDB configuration error: ${lastDatabaseError.message}`);
     return;
   }
   if (!/^mongodb(?:\+srv)?:\/\/(?:[^@/?#]+@)?[^/?#]+(?:[/?#].*)?$/i.test(MONGODB_URI)) {
-    console.error('MongoDB configuration error: MONGODB_URI must be a valid mongodb:// or mongodb+srv:// connection string.');
+    lastDatabaseError = new Error('MONGODB_URI must be a valid mongodb:// or mongodb+srv:// connection string.');
+    console.error(`MongoDB configuration error: ${lastDatabaseError.message}`);
     return;
   }
 
@@ -1476,6 +1497,7 @@ async function startServer() {
       await initializeMongo();
       return;
     } catch (error) {
+      lastDatabaseError = error;
       console.error(`Unable to connect to MongoDB at startup (attempt ${attempt}): ${error.message}`);
       console.error('The HTTP server remains available; MongoDB-backed API requests will return HTTP 503 while the database is unavailable.');
       if (/querySrv.*ECONNREFUSED/i.test(error.message) && /^mongodb\+srv:\/\//i.test(MONGODB_URI)) {
